@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Quarto / knitr render byproducts
+/.quarto/
+*_files/
+*_cache/
+*.rmarkdown
+
+# R session artifacts
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata

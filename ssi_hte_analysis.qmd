@@ -1,0 +1,1331 @@
+---
+title: "Heterogeneous Treatment Effects in a Crowdsourced Megastudy of Single-Session Interventions for Depression"
+subtitle: "Reproducible analysis"
+date: today
+date-format: "MMMM D, YYYY"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    df-print: paged
+    code-fold: false
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: false
+editor: visual
+---
+
+# Overview
+
+Reproduces the secondary HTE analysis of a crowdsourced megastudy of single-session interventions (SSIs) for depression (N = 7,505; 12 SSIs vs. control). Run `Rscript R/01_generate_ipw_weights.R` first to produce `data/sl_weights.csv`, then render this document. Tables and figures are written to `output/`. See `README.md` for details.
+
+# Setup
+
+```{r setup}
+library(tidyverse)
+library(grf)
+library(mclust)
+library(glmnet)
+library(tidymodels)
+library(emmeans)
+library(broom)
+library(boot)
+library(corrplot)
+library(reshape2)
+library(ggrepel)
+library(car)
+
+# Serpentine sort + fold helper (self-contained; no external packages)
+source(file.path("R", "sl_helpers.R"))
+
+ssi_labels <- c(
+  "5 Habits to Beat Depression", "AI-assisted Personalized Narrative",
+  "Behavioral Activation", "Dialectical Behavioral Therapy Skills",
+  "Inner Child Healing Walk", "Interactive Cognitive Reappraisal",
+  "Mindful Acceptance", "Mindful Attention Skills", "Moral Elevation",
+  "Personalized Intervention Recommender", "Reframing Negative Thoughts",
+  "Savoring Strategies"
+)
+
+# ---- Paths (relative to this document) ---------------------------------
+DATA_DIR    <- "data"
+TABLES_DIR  <- file.path("output", "tables")
+FIGURES_DIR <- file.path("output", "figures")
+
+dir.create(TABLES_DIR,  showWarnings = FALSE, recursive = TRUE)
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Data load and cleaning
+
+```{r data-load}
+mydata <- read.csv(file.path(DATA_DIR, "ml_clean.csv"), header = TRUE)
+mydata <- mydata[, -1]  # drop leading row-number column
+mydata <- mydata %>% select(-help_prefer_not_say_baseline)  # zero-variance
+
+# Reverse-score PHQ-9 follow-up: higher = better, matches HTE convention
+mydata$phq9_score_followup <- 27 - mydata$phq9_score_followup
+
+# Build PHQ-9 baseline raw + reverse-scored versions
+items_phq9_baseline    <- paste0("phq9_", 1:9, "_baseline")
+mydata$phq9_pre_raw    <- rowSums(mydata[, items_phq9_baseline], na.rm = TRUE)
+mydata$phq9_pre_rev    <- 27 - mydata$phq9_pre_raw
+
+# Follow-up completion indicator
+mydata$fup_complete <- as.integer(!is.na(mydata$phq9_score_followup))
+
+# Intervention-vs-control indicator
+mydata$int_binary <- ifelse(mydata$group_numeric == 13, 0, 1)
+
+# Note: `group_numeric` is left as integer here so it joins cleanly with
+# `sl_weights.csv` in the next chunk. It is converted to a factor
+# (with control = 13 as reference) later, after the IPW merge.
+
+cat("N randomized:", nrow(mydata), "\n")
+cat("N completers (4-week PHQ-9):", sum(mydata$fup_complete), "\n")
+```
+
+## Drop low-variance covariates
+
+```{r drop-low-var}
+# Baseline covariate columns (positions 4:102 in the cleaned file)
+W_full <- mydata[, 4:102]
+
+constant_vars <- sapply(W_full, function(x) length(unique(x)) <= 1)
+low_variance  <- sapply(W_full, function(x) {
+  if (is.numeric(x) && all(x %in% c(0, 1))) {
+    min(sum(x == 0, na.rm = TRUE), sum(x == 1, na.rm = TRUE)) < 5
+  } else {
+    FALSE
+  }
+})
+
+keep_cols <- !(constant_vars | low_variance)
+cat("Dropped",  sum(!keep_cols), "low/zero-variance baseline covariates\n")
+cat("Retained", sum(keep_cols), "baseline covariates for CATE estimation\n")
+```
+
+# Attach loss-to-follow-up weights
+
+Join the weights from step 1 onto `mydata` by `pid` × `group_numeric`.
+
+```{r attach-weights}
+weights_path <- file.path(DATA_DIR, "sl_weights.csv")
+if (!file.exists(weights_path)) {
+  stop("data/sl_weights.csv not found. Run `Rscript R/01_generate_ipw_weights.R` first.")
+}
+
+weights_long <- read.csv(weights_path)
+weights_to_merge <- weights_long %>%
+  select(pid, intervention, w_norm) %>%
+  distinct()
+
+mydata <- mydata %>%
+  left_join(weights_to_merge,
+            by = c("pid", "group_numeric" = "intervention"))
+
+stopifnot(sum(is.na(mydata$w_norm)) == 0)
+
+# Now safe to convert `group_numeric` to a factor with control as reference.
+mydata$group_numeric <- factor(mydata$group_numeric)
+mydata$group_numeric <- relevel(mydata$group_numeric, ref = "13")
+```
+
+# CATE estimation --- Generalized Causal Forests with 10-fold CV
+
+For each SSI, a CATE relative to control (arm 13) is estimated from `grf::causal_forest` fit on 10 training folds (`make_folds_serpentine()`). Focal-arm and control participants get out-of-fold predictions; everyone else gets the average of the 10 forests.
+
+```{r cate-estimate}
+df_cate <- {
+
+  controls   <- mydata %>% filter(group_numeric == 13)
+  controls_f <- make_folds_serpentine(controls, nfolds = 10, seed = 123)
+  control_folds_map <- controls_f %>% select(pid, fold)
+
+  arms <- 1:12
+  n_participants <- nrow(mydata)
+  pid_vec <- mydata$pid
+
+  mat_cate <- matrix(NA_real_,
+                     nrow = n_participants,
+                     ncol = length(arms),
+                     dimnames = list(NULL, sprintf("CATE_%d", arms)))
+
+  X_all <- as.matrix(mydata[, 4:102])
+
+  for (arm in arms) {
+    message(sprintf("Arm %d vs 13 (10-fold CV)", arm))
+
+    arm_dat <- mydata %>% filter(group_numeric == arm)
+    arm_f   <- make_folds_serpentine(arm_dat, nfolds = 10, seed = 1000 + arm)
+    arm_folds_map <- arm_f %>% select(pid, fold)
+
+    analytic <- mydata %>%
+      filter(group_numeric %in% c(13, arm)) %>%
+      left_join(control_folds_map, by = "pid") %>%
+      left_join(arm_folds_map,     by = "pid",
+                suffix = c("_ctrl", "_arm")) %>%
+      mutate(fold = ifelse(group_numeric == 13, fold_ctrl, fold_arm)) %>%
+      select(-fold_ctrl, -fold_arm)
+
+    analytic_obs <- analytic %>% filter(!is.na(phq9_score_followup))
+
+    oof_tau <- rep(NA_real_, nrow(analytic_obs))
+    forests <- vector("list", 10)
+
+    for (k in 1:10) {
+      train_k <- analytic_obs %>% filter(fold != k)
+      test_k  <- analytic_obs %>% filter(fold == k)
+      if (nrow(train_k) < 20 || nrow(test_k) < 1) next
+
+      X_train  <- as.matrix(train_k[, 4:102])
+      Y_train  <- as.numeric(train_k$phq9_score_followup)
+      W_train  <- as.integer(train_k$group_numeric == arm)
+      wt_train <- as.numeric(train_k$w_norm)
+
+      set.seed(2000 + arm * 100 + k)
+      cf_k <- grf::causal_forest(
+        X_train, Y_train, W_train,
+        sample.weights = wt_train,
+        num.trees      = 4000
+      )
+      forests[[k]] <- cf_k
+
+      X_test <- as.matrix(test_k[, 4:102])
+      idx    <- which(analytic_obs$fold == k)
+      oof_tau[idx] <- as.numeric(predict(cf_k, X_test)$predictions)
+    }
+
+    tau_arm_all <- rep(NA_real_, n_participants)
+    tau_arm_all[match(analytic_obs$pid, mydata$pid)] <- oof_tau
+
+    # Predict onto everyone NOT in controls or this arm using the saved forests.
+    other_idx <- which(!(mydata$group_numeric %in% c(13, arm)))
+    pred_mat  <- matrix(NA_real_, nrow = length(other_idx), ncol = 10)
+    for (k in 1:10) {
+      if (is.null(forests[[k]])) next
+      pred_mat[, k] <- as.numeric(
+        predict(forests[[k]], X_all[other_idx, , drop = FALSE])$predictions)
+    }
+    tau_arm_all[other_idx] <- rowMeans(pred_mat, na.rm = TRUE)
+
+    # Backfill any remaining NAs (skipped folds, missing outcomes in arm/control)
+    miss_idx <- which(is.na(tau_arm_all))
+    if (length(miss_idx) > 0) {
+      pred_mat_all <- matrix(NA_real_, nrow = length(miss_idx), ncol = 10)
+      for (k in 1:10) {
+        if (is.null(forests[[k]])) next
+        pred_mat_all[, k] <- as.numeric(
+          predict(forests[[k]], X_all[miss_idx, , drop = FALSE])$predictions)
+      }
+      tau_arm_all[miss_idx] <- rowMeans(pred_mat_all, na.rm = TRUE)
+    }
+
+    mat_cate[, arm] <- tau_arm_all
+  }
+
+  data.frame(pid = pid_vec, mat_cate)
+}
+
+stopifnot(sum(is.na(df_cate)) == 0)
+head(df_cate)
+```
+
+## GCF calibration → Supplementary Table 2
+
+Per arm, fit a causal forest on the focal-arm + control sample and run `grf::test_calibration` (mean- and differential-prediction coefficients).
+
+```{r gcf-calibration}
+calibration_results <- {
+  out <- data.frame()
+  for (arm in 1:12) {
+    analytic_obs <- mydata %>%
+      filter(group_numeric %in% c(arm, 13),
+             !is.na(phq9_score_followup))
+
+    X_full  <- as.matrix(analytic_obs[, 4:102])
+    Y_full  <- as.numeric(analytic_obs$phq9_score_followup)
+    W_full  <- as.integer(analytic_obs$group_numeric == arm)
+    wt_full <- as.numeric(analytic_obs$w_norm)
+
+    set.seed(3000 + arm)
+    cf_full <- grf::causal_forest(
+      X_full, Y_full, W_full,
+      sample.weights = wt_full,
+      num.trees      = 4000
+    )
+    cal <- test_calibration(cf_full)
+
+    out <- rbind(out, data.frame(
+      arm      = arm,
+      mean_est = cal[1, 1], mean_se = cal[1, 2], mean_p = cal[1, 4],
+      diff_est = cal[2, 1], diff_se = cal[2, 2], diff_p = cal[2, 4]
+    ))
+  }
+  out
+}
+
+calibration_results$SSI <- ssi_labels[calibration_results$arm]
+cal_out <- calibration_results[, c("arm", "SSI", "mean_est", "mean_se", "mean_p",
+                                    "diff_est", "diff_se", "diff_p")]
+write.csv(cal_out,
+          file.path(TABLES_DIR, "supp_table2_calibration.csv"),
+          row.names = FALSE)
+print(cal_out, digits = 3)
+```
+
+## CATE 12 × 12 correlation → Supplementary Figure 1
+
+```{r cate-correlations}
+cate_cor <- cor(df_cate %>% select(starts_with("CATE_")), use = "complete.obs")
+colnames(cate_cor) <- rownames(cate_cor) <- paste("SSI", 1:12)
+
+png(file.path(FIGURES_DIR, "supp_fig1_cate_correlations.png"),
+    width = 7, height = 7, units = "in", res = 300)
+corrplot(cate_cor, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black",
+         number.cex = 0.7,
+         col = colorRampPalette(c("blue", "white", "red"))(200))
+dev.off()
+
+corrplot(cate_cor, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black",
+         number.cex = 0.7,
+         col = colorRampPalette(c("blue", "white", "red"))(200))
+```
+
+# Latent profile analysis (LPA) on CATE matrix
+
+Standardize the 12 CATE columns and fit `mclust::Mclust(G = 1:10)` across 10 seeds; keep the best-BIC run as `mod_train`.
+
+```{r lpa}
+X_train <- scale(as.matrix(df_cate %>% select(-pid)))
+
+mod_train <- {
+  n_runs <- 10
+  models <- vector("list", n_runs)
+  for (i in 1:n_runs) {
+    set.seed(123 + i)
+    models[[i]] <- Mclust(X_train, G = 1:10)
+  }
+  bics <- sapply(models, function(m) m$bic)
+  best <- which.max(bics)
+  models[[best]]
+}
+
+cat("Best LPA: G =", mod_train$G,
+    " modelName =", mod_train$modelName,
+    " BIC =", round(mod_train$bic, 1), "\n")
+
+# Compare solutions across G and covariance parameterizations
+cat("Top models by BIC (model, G):\n")
+print(summary(mod_train$BIC))
+cat("\nFull BIC matrix (rows = G, cols = covariance model):\n")
+print(round(mod_train$BIC, 1))
+
+cl_train <- mod_train$classification
+df_cate$cluster_assignment <- cl_train
+
+mydata <- mydata %>%
+  left_join(df_cate %>% select(pid, cluster_assignment), by = "pid")
+
+cat("\nCluster sizes:\n")
+print(table(mydata$cluster_assignment))
+```
+
+## Figure 1 --- CATE profiles by cluster
+
+```{r figure1}
+cluster_means_df <- as.data.frame(mod_train$parameters$mean)
+colnames(cluster_means_df) <- paste("Cluster", seq_len(mod_train$G))
+cluster_means_df_t <- t(cluster_means_df)
+cluster_means_long <- reshape2::melt(cluster_means_df_t)
+colnames(cluster_means_long) <- c("Cluster", "Variable", "Mean")
+cluster_means_long$Cluster <- factor(cluster_means_long$Cluster)
+
+last_points <- cluster_means_long %>%
+  group_by(Variable) %>%
+  filter(Cluster == last(levels(Cluster)))
+
+fig1 <- ggplot(cluster_means_long,
+               aes(x = Cluster, y = Mean, color = Variable, group = Variable)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_text_repel(
+    data = last_points,
+    aes(label = gsub("CATE_", "SSI ", Variable)),
+    nudge_x = 0.3, direction = "y", hjust = 0,
+    segment.color = "grey70", size = 3
+  ) +
+  labs(x = "Cluster",
+       y = "Mean CATE (standardized across participants)") +
+  scale_color_viridis_d(option = "turbo") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.margin = margin(10, 60, 10, 10))
+
+ggsave(file.path(FIGURES_DIR, "cate_profiles.png"),
+       fig1, width = 9, height = 6, dpi = 300)
+
+fig1
+```
+
+## Supplementary Table 5 --- Mean CATEs by SSI and cluster
+
+```{r mean-cate-table}
+mean_cate_tbl <- as.data.frame(mod_train$parameters$mean) %>%
+  setNames(paste("Cluster", seq_len(mod_train$G))) %>%
+  tibble::rownames_to_column("ssi") %>%
+  mutate(
+    ssi_num = as.integer(str_extract(ssi, "\\d+")),
+    No.     = ssi_num,
+    SSI     = ssi_labels[ssi_num],
+    Target  = case_when(
+      ssi_num %in% c(1, 5, 7, 8, 9) ~ "Cluster 1",
+      ssi_num %in% c(10, 12)         ~ "Cluster 3",
+      TRUE                           ~ ""
+    )
+  ) %>%
+  arrange(ssi_num) %>%
+  mutate(across(starts_with("Cluster "), \(x) round(x, 2))) %>%
+  select(No., SSI, Target,
+         `Cluster 1`, `Cluster 2`, `Cluster 3`, `Cluster 4`)
+
+print(mean_cate_tbl)
+write.csv(mean_cate_tbl,
+          file.path(TABLES_DIR, "supp_table5_mean_cates.csv"),
+          row.names = FALSE)
+```
+
+## Supplementary Table 3 --- Classification quality
+
+Per-cluster mean modal posterior probability and relative entropy ($1 - \bar{H}_k / \log K$; higher = better separation).
+
+```{r supp-table3}
+post <- as.data.frame(mod_train$z)
+colnames(post) <- paste0("p_cl", seq_len(ncol(post)))
+
+K <- mod_train$G
+dat_post <- mydata %>%
+  bind_cols(post) %>%
+  mutate(
+    max_prob = apply(select(., starts_with("p_cl")), 1, max),
+    entropy  = apply(select(., starts_with("p_cl")), 1,
+                     function(p) -sum(ifelse(p > 0, p * log(p), 0)))
+  )
+
+supp_table3 <- dat_post %>%
+  group_by(cluster_assignment) %>%
+  summarise(
+    n                    = n(),
+    mean_max_posterior   = mean(max_prob),
+    median_max_posterior = median(max_prob),
+    mean_entropy         = mean(entropy),
+    relative_entropy     = 1 - mean(entropy) / log(K),
+    .groups = "drop"
+  )
+
+print(supp_table3, digits = 3)
+write.csv(supp_table3,
+          file.path(TABLES_DIR, "supp_table3_lpa_classification.csv"),
+          row.names = FALSE)
+```
+
+# Overall ATE checks
+
+```{r overall-ate}
+# 1) Any SSI vs control
+lm_binary <- lm(phq9_score_followup ~ phq9_pre_rev + int_binary,
+                data = mydata, weights = w_norm)
+cat("=== Any SSI vs Control ===\n")
+print(tidy(lm_binary) %>% filter(term == "int_binary"), digits = 3)
+
+# 2) 12-arm omnibus among intervention arms only
+dat_int <- subset(mydata, group_numeric != "13")
+dat_int$group_int_f <- factor(dat_int$group_numeric)
+lm_int_only <- lm(phq9_score_followup ~ phq9_pre_rev + group_int_f,
+                  data = dat_int, weights = w_norm)
+cat("\n=== Omnibus across 12 SSIs (intervention arms only) ===\n")
+print(car::Anova(lm_int_only, type = 2))
+```
+
+## Supplementary Table 4 --- Per-arm vs control with FDR
+
+```{r supp-table4}
+mydata$group_f <- factor(mydata$group_numeric)
+mydata$group_f <- relevel(mydata$group_f, ref = "13")
+
+lm_main   <- lm(phq9_score_followup ~ phq9_pre_rev + group_f,
+                data = mydata, weights = w_norm)
+coef_tab  <- summary(lm_main)$coefficients
+ssi_rows  <- grep("^group_f", rownames(coef_tab))
+
+supp_table4 <- data.frame(
+  ssi    = gsub("group_f", "SSI ", rownames(coef_tab)[ssi_rows]),
+  b      = coef_tab[ssi_rows, "Estimate"],
+  se     = coef_tab[ssi_rows, "Std. Error"],
+  t      = coef_tab[ssi_rows, "t value"],
+  p_raw  = coef_tab[ssi_rows, "Pr(>|t|)"]
+) %>%
+  mutate(p_fdr = p.adjust(p_raw, method = "BH")) %>%
+  arrange(p_raw) %>%
+  mutate(
+    ssi_num = as.integer(gsub("SSI ", "", ssi)),
+    ssi     = paste0(ssi_num, ". ", ssi_labels[ssi_num])
+  ) %>%
+  select(-ssi_num)
+
+print(supp_table4, digits = 3)
+write.csv(supp_table4,
+          file.path(TABLES_DIR, "supp_table4_per_arm_fdr.csv"),
+          row.names = FALSE)
+```
+
+# Cluster-specific intervention effects → Table 3
+
+```{r table3}
+targets <- list(
+  "1" = c("1", "5", "7", "8", "9"),
+  "2" = c("2", "3", "6", "9", "11"),
+  "3" = c("10", "12"),
+  "4" = c("3", "5")
+)
+
+mydata$cluster_assignment <- factor(mydata$cluster_assignment)
+mydata$group_numeric_chr  <- as.character(mydata$group_numeric)
+
+cluster_subsets <- list(
+  d1 = subset(mydata, cluster_assignment == "1"),
+  d2 = subset(mydata, cluster_assignment == "2"),
+  d3 = subset(mydata, cluster_assignment == "3"),
+  d4 = subset(mydata, cluster_assignment == "4")
+)
+
+# Helper closures
+fit_binary <- function(d) {
+  d$int_binary <- ifelse(d$group_numeric_chr == "13", 0, 1)
+  mod <- lm(phq9_score_followup ~ phq9_pre_rev + int_binary,
+            data = d, weights = w_norm)
+  tidy(mod) %>% filter(term == "int_binary")
+}
+
+fit_target <- function(d, tgt) {
+  d$int_binary <- ifelse(d$group_numeric_chr == "13", 0, 1)
+  d$int_target <- ifelse(d$group_numeric_chr %in% tgt, 1, 0)
+  mod <- lm(phq9_score_followup ~ phq9_pre_rev + int_binary + int_target,
+            data = d, weights = w_norm)
+  tidy(mod) %>% filter(term == "int_target")
+}
+
+fit_emm_pairs <- function(d, tgt) {
+  d$trt_3cat <- factor(
+    ifelse(d$group_numeric_chr == "13", "control",
+           ifelse(d$group_numeric_chr %in% tgt, "target", "other_int")),
+    levels = c("control", "other_int", "target")
+  )
+  mod <- lm(phq9_score_followup ~ phq9_pre_rev + trt_3cat,
+            data = d, weights = w_norm)
+  # reverse = TRUE: contrasts read intervention - control (positive = improvement)
+  pairs(emmeans(mod, specs = "trt_3cat"), reverse = TRUE) %>% as.data.frame()
+}
+
+fit_ftest <- function(d, tgt) {
+  d$int_binary <- ifelse(d$group_numeric_chr == "13", 0, 1)
+  d$int_target <- ifelse(d$group_numeric_chr %in% tgt, 1, 0)
+  mod_base   <- lm(phq9_score_followup ~ phq9_pre_rev + int_binary,
+                   data = d, weights = w_norm)
+  mod_target <- lm(phq9_score_followup ~ phq9_pre_rev + int_binary + int_target,
+                   data = d, weights = w_norm)
+  a <- anova(mod_base, mod_target)
+  data.frame(delta_F = a$F[2], df1 = a$Df[2], df_resid = a$Res.Df[2],
+             p.value = a$`Pr(>F)`[2])
+}
+
+# Format helpers
+fmt_p_tbl <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < .001) return("< .001")
+  sub("^0\\.", ".", sprintf("%.3f", p))
+}
+n_completers <- function(d) sum(!is.na(d$phq9_score_followup))
+indent <- strrep("\u00A0", 4)   # non-breaking spaces so sub-rows indent in HTML/Word
+
+# Compute models for all clusters
+m1 <- lapply(seq_along(cluster_subsets),
+             function(i) fit_binary(cluster_subsets[[i]]))
+m2 <- lapply(seq_along(cluster_subsets),
+             function(i) fit_target(cluster_subsets[[i]],
+                                    targets[[as.character(i)]]))
+emm_list <- lapply(seq_along(cluster_subsets),
+                   function(i) fit_emm_pairs(cluster_subsets[[i]],
+                                             targets[[as.character(i)]]))
+ftests <- lapply(seq_along(cluster_subsets),
+                 function(i) fit_ftest(cluster_subsets[[i]],
+                                       targets[[as.character(i)]]))
+
+# Cluster metadata
+cluster_meta <- list(
+  list(label = "Cluster 1 (primary)",     targets_str = "1, 5, 7, 8, 9"),
+  list(label = "Cluster 2 (exploratory)", targets_str = "2, 3, 6, 9, 11"),
+  list(label = "Cluster 3 (primary)",     targets_str = "10, 12"),
+  list(label = "Cluster 4 (exploratory)", targets_str = "3, 5")
+)
+
+# Build long-format table (Metric | b | SE | t | p)
+long_rows <- list()
+for (i in 1:4) {
+  n_c <- n_completers(cluster_subsets[[i]])
+  ft  <- ftests[[i]]
+  hdr <- sprintf("%s (n = %d; target SSIs: %s)",
+                 cluster_meta[[i]]$label, n_c, cluster_meta[[i]]$targets_str)
+
+  long_rows[[length(long_rows) + 1]] <- data.frame(
+    Metric = hdr, b = NA_real_, SE = NA_real_, t = NA_real_,
+    p = NA_character_, stringsAsFactors = FALSE)
+
+  long_rows[[length(long_rows) + 1]] <- data.frame(
+    Metric = paste0(indent, "Any SSI vs. control"),
+    b  = round(m1[[i]]$estimate,  2),
+    SE = round(m1[[i]]$std.error, 2),
+    t  = round(m1[[i]]$statistic, 2),
+    p  = fmt_p_tbl(m1[[i]]$p.value),
+    stringsAsFactors = FALSE)
+
+  long_rows[[length(long_rows) + 1]] <- data.frame(
+    Metric = paste0(indent, "Target SSI (incremental)"),
+    b  = round(m2[[i]]$estimate,  2),
+    SE = round(m2[[i]]$std.error, 2),
+    t  = round(m2[[i]]$statistic, 2),
+    p  = fmt_p_tbl(m2[[i]]$p.value),
+    stringsAsFactors = FALSE)
+
+  long_rows[[length(long_rows) + 1]] <- data.frame(
+    Metric = sprintf("%sModel fit improvement: ΔF(%d, %d) = %.2f",
+                     indent, ft$df1, ft$df_resid, ft$delta_F),
+    b = NA_real_, SE = NA_real_, t = NA_real_,
+    p = fmt_p_tbl(ft$p.value),
+    stringsAsFactors = FALSE)
+
+  for (cname in c("target - control", "other_int - control", "target - other_int")) {
+    lbl <- switch(cname,
+      "target - control"    = paste0(indent, "Target SSIs vs. control"),
+      "other_int - control" = paste0(indent, "Other SSIs vs. control"),
+      "target - other_int"  = paste0(indent, "Target SSIs vs. other SSIs"))
+    crow <- emm_list[[i]] %>% filter(contrast == cname)
+    if (nrow(crow) == 0) next
+    long_rows[[length(long_rows) + 1]] <- data.frame(
+      Metric = lbl,
+      b  = round(crow$estimate, 2),
+      SE = round(crow$SE,       2),
+      t  = round(crow$t.ratio,  2),
+      p  = fmt_p_tbl(crow$p.value),
+      stringsAsFactors = FALSE)
+  }
+}
+
+table3 <- do.call(rbind, long_rows)
+rownames(table3) <- NULL
+print(table3)
+
+write.csv(table3,
+          file.path(TABLES_DIR, "table3_cluster_effects.csv"),
+          row.names = FALSE)
+
+# Cluster × target-intervention interaction (Cluster 1 follow-up reported in text)
+dat_target <- subset(mydata, group_numeric_chr == "13" |
+                              group_numeric_chr %in% targets[["1"]])
+dat_target$int_target <- ifelse(dat_target$group_numeric_chr == "13", 0, 1)
+lm_target_cluster <- lm(
+  phq9_score_followup ~ phq9_pre_rev + cluster_assignment * int_target,
+  data    = dat_target,
+  weights = w_norm
+)
+cat("\n=== Cluster × Target-intervention (Cluster 1 targets) interaction ===\n")
+print(car::Anova(lm_target_cluster, type = 2))
+print(pairs(emmeans(lm_target_cluster, ~ int_target | cluster_assignment), reverse = TRUE))
+
+# Cluster × target-intervention interaction (Cluster 3 follow-up reported in text)
+dat_target_c3 <- subset(mydata, group_numeric_chr == "13" |
+                                 group_numeric_chr %in% targets[["3"]])
+dat_target_c3$int_target <- ifelse(dat_target_c3$group_numeric_chr == "13", 0, 1)
+lm_target_cluster_c3 <- lm(
+  phq9_score_followup ~ phq9_pre_rev + cluster_assignment * int_target,
+  data    = dat_target_c3,
+  weights = w_norm
+)
+cat("\n=== Cluster × Target-intervention (Cluster 3 targets) interaction ===\n")
+print(car::Anova(lm_target_cluster_c3, type = 2))
+print(pairs(emmeans(lm_target_cluster_c3, ~ int_target | cluster_assignment), reverse = TRUE))
+```
+
+# Cluster characterization --- LASSO
+
+Binary LASSO logistic regressions (cluster *k* vs. rest) with 10-fold CV (`tidymodels`/`glmnet`), using baseline scale totals plus demographics; item-level covariates that roll up into totals are dropped.
+
+```{r lasso-setup}
+dat_post <- dat_post %>%
+  mutate(
+    hopeless_score_baseline = q1_beck_baseline + q2_beck_baseline +
+                              q3_beck_baseline + q4_beck_baseline,
+    fats_score_baseline     = rowSums(across(fats_1_baseline:fats_12_baseline)),
+    readiness_score_baseline = ready_important_baseline + ready_confident_baseline,
+    agency_score_baseline    = agency_q1_baseline + agency_q2_baseline +
+                               agency_q3_baseline,
+    dep_expectancies_score_baseline = expect_donthelp_r_baseline +
+                                       expect_wontwork_r_baseline +
+                                       expect_positive_baseline
+  )
+
+drop_items <- c(
+  paste0("phq9_", 1:9, "_baseline"),
+  paste0("q", 1:4, "_beck_baseline"),
+  paste0("fats_", 1:12, "_baseline"),
+  paste0("agency_q", 1:3, "_baseline"),
+  c("ready_important_baseline", "ready_confident_baseline",
+    "expect_donthelp_r_baseline", "expect_wontwork_r_baseline",
+    "expect_positive_baseline")
+)
+
+scale_totals <- c(
+  "phq9_pre_rev", "hopeless_score_baseline", "fats_score_baseline",
+  "readiness_score_baseline", "agency_score_baseline",
+  "dep_expectancies_score_baseline", "ffmq_distressing_baseline"
+)
+
+lasso_predictors <- function(data) {
+  # Defense-in-depth: also strip any `c\d+_binary` cluster indicators that
+  # might have been added downstream — they would leak the outcome.
+  drop_cols <- c("pid", "w_norm", "cluster_assignment",
+                 "phq9_score_followup", "fup_complete", "int_binary",
+                 "phq9_pre_raw", "group_numeric", "group_f",
+                 "group_numeric_chr",
+                 grep("^p_cl",       names(data), value = TRUE),
+                 grep("^c\\d+_binary$", names(data), value = TRUE),
+                 "max_prob", "entropy")
+  candidates <- setdiff(names(data),
+                        c(drop_cols, intersect(names(data), drop_items)))
+  unique(c(candidates, intersect(scale_totals, names(data))))
+}
+
+run_lasso <- function(data, target_cluster, seed = 123) {
+  preds <- lasso_predictors(data)
+  d <- data %>%
+    mutate(target = factor(if_else(cluster_assignment == target_cluster,
+                                    "Target", "Other"))) %>%
+    select(target, all_of(preds))
+
+  set.seed(seed)
+  rec <- recipe(target ~ ., data = d) %>%
+    step_nzv(all_predictors()) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+  spec <- logistic_reg(mode = "classification",
+                       penalty = tune(), mixture = 1) %>%
+    set_engine("glmnet")
+  wf    <- workflow() %>% add_recipe(rec) %>% add_model(spec)
+  folds <- vfold_cv(d, v = 10, strata = target)
+  grid  <- grid_regular(penalty(), levels = 60)
+  res   <- tune_grid(wf, resamples = folds, grid = grid,
+                     metrics = metric_set(roc_auc))
+  best  <- select_best(res, metric = "roc_auc")
+  fit_final <- finalize_workflow(wf, best) %>% fit(d)
+  tidy(fit_final) %>%
+    filter(term != "(Intercept)", estimate != 0) %>%
+    mutate(abs_est = abs(estimate)) %>%
+    arrange(desc(abs_est))
+}
+```
+
+## Cluster 1 LASSO
+
+```{r lasso-c1}
+var_labels <- c(
+  phq9_pre_rev                    = "Baseline PHQ-9 (reverse scored)",
+  fats_score_baseline             = "FATS",
+  agency_score_baseline           = "Agency — State Hope Scale",
+  hopeless_score_baseline         = "Hopelessness — BHS-4",
+  dep_expectancies_score_baseline = "Depression change expectancies — DCES",
+  age_baseline                    = "Age",
+  income_ordered_baseline         = "Household income (ordered)",
+  social_ladder_baseline          = "MacArthur Social Ladder",
+  education_ordered_baseline      = "Education (ordered)",
+  disability_yes_baseline         = "Disability or chronic condition",
+  help_mental_health_app_baseline = "Prior mental health app use",
+  help_online_resource_baseline   = "Prior online mental health resource use",
+  gender_woman_baseline           = "Gender: woman",
+  gender_man_baseline             = "Gender: man",
+  political_party_independent_baseline    = "Political Party: Independent",
+  political_party_republican_baseline     = "Political Party: Republican",
+  political_party_something_else_baseline = "Political Party: Something else",
+  race_white_baseline                     = "Race: White",
+  race_black_baseline                     = "Race: Black",
+  ethnicity_not_hispanic_baseline         = "Ethnicity: Not Hispanic/Latino",
+  ethnicity_mexican_baseline              = "Ethnicity: Mexican",
+  employment_student_baseline             = "Employment: Student",
+  employment_full_time_baseline           = "Employment: Full-time",
+  employment_part_time_baseline           = "Employment: Part-time",
+  employment_unemployed_baseline          = "Employment: Unemployed",
+  employment_not_in_paid_work_baseline    = "Employment: Not in paid work",
+  marital_status_in_relationship_baseline = "Marital Status: In a relationship",
+  marital_status_married_baseline         = "Marital Status: Married",
+  marital_status_divorced_baseline        = "Marital Status: Divorced",
+  help_support_group_baseline             = "Prior help: Support group",
+  help_phone_text_baseline                = "Prior help: Phone/text line",
+  help_therapist_baseline                 = "Prior help: Therapist",
+  help_medical_doctor_baseline            = "Prior help: Medical doctor",
+  help_book_video_baseline                = "Prior help: Book/video",
+  help_no_formal_support_baseline         = "Prior help: No formal support",
+  readiness_score_baseline                = "Readiness to change",
+  ffmq_distressing_baseline               = "FFMQ — Non-reactivity to distressing thoughts",
+  recruitment_platform_prolific_baseline  = "Recruitment platform: Prolific"
+)
+relabel_terms <- function(df) {
+  df %>% mutate(term = ifelse(
+    term %in% names(var_labels),
+    var_labels[term],
+    gsub("_baseline$", "", gsub("_", " ", term))
+  ))
+}
+
+lasso_c1 <- run_lasso(dat_post, target_cluster = 1, seed = 123)
+print(lasso_c1, n = Inf)
+write.csv(relabel_terms(lasso_c1),
+          file.path(TABLES_DIR, "supp_table6_lasso_cluster1.csv"),
+          row.names = FALSE)
+```
+
+## Cluster 3 LASSO
+
+```{r lasso-c3}
+lasso_c3 <- run_lasso(dat_post, target_cluster = 3, seed = 123)
+print(lasso_c3, n = Inf)
+write.csv(relabel_terms(lasso_c3),
+          file.path(TABLES_DIR, "supp_table7_lasso_cluster3.csv"),
+          row.names = FALSE)
+```
+
+# SSI characteristics by target / non-target → Supplementary Table 8
+
+```{r ssi-characteristics}
+ssi_char <- read.csv(file.path(DATA_DIR, "ssi_characteristics.csv"),
+                     header = TRUE) %>%
+  mutate(group_numeric = case_when(
+    str_detect(Program_Name, "5 Habits")              ~ 1,
+    str_detect(Program_Name, "AI-assisted")           ~ 2,
+    str_detect(Program_Name, "Behavioral Activation") ~ 3,
+    str_detect(Program_Name, "Dialectical")           ~ 4,
+    str_detect(Program_Name, "Inner Child")           ~ 5,
+    str_detect(Program_Name, "Interactive Cognitive") ~ 6,
+    str_detect(Program_Name, "Mindful Acceptance")    ~ 7,
+    str_detect(Program_Name, "Mindful Attention")     ~ 8,
+    str_detect(Program_Name, "Moral Elevation")       ~ 9,
+    str_detect(Program_Name, "Personalized Intervention") ~ 10,
+    str_detect(Program_Name, "Reframing Negative")    ~ 11,
+    str_detect(Program_Name, "Savoring")              ~ 12,
+    TRUE ~ NA_real_
+  ))
+
+continuous_vars <- c("Engagingness", "Interactive_Activities", "Effortful",
+                     "Personalization", "Cognitive_Reframing",
+                     "Behavioral_Activation", "Mindfulness")
+binary_vars     <- c("Video_Audio", "References_Depression", "Links_to_Resources",
+                     "Meditation_Practice", "Clinician_Created", "Take_Home_Reminder")
+
+df_char <- ssi_char %>%
+  mutate(
+    target_c1 = if_else(group_numeric %in% c(1, 5, 7, 8, 9), "Target", "Other"),
+    target_c3 = if_else(group_numeric %in% c(10, 12),       "Target", "Other"),
+    across(all_of(binary_vars), ~ if_else(. == "Yes", 1L, 0L))
+  )
+
+summarize_by_target <- function(data, target_var) {
+  cont_tbl <- data %>%
+    group_by({{ target_var }}) %>%
+    summarise(across(all_of(continuous_vars),
+                     ~ sprintf("%.2f (%.2f)", mean(., na.rm = TRUE),
+                                              sd(., na.rm = TRUE))),
+              .groups = "drop") %>%
+    pivot_longer(-{{ target_var }}, names_to = "Characteristic", values_to = "val") %>%
+    pivot_wider(names_from = {{ target_var }}, values_from = "val") %>%
+    mutate(type = "continuous")
+
+  bin_tbl <- data %>%
+    group_by({{ target_var }}) %>%
+    summarise(across(all_of(binary_vars),
+                     ~ sprintf("%d (%.0f%%)", sum(., na.rm = TRUE),
+                                              100 * mean(., na.rm = TRUE))),
+              .groups = "drop") %>%
+    pivot_longer(-{{ target_var }}, names_to = "Characteristic", values_to = "val") %>%
+    pivot_wider(names_from = {{ target_var }}, values_from = "val") %>%
+    mutate(type = "binary")
+
+  bind_rows(cont_tbl, bin_tbl) %>%
+    arrange(type, Characteristic)
+}
+
+table_c1 <- summarize_by_target(df_char, target_c1) %>%
+  rename(Other_C1 = Other, Target_C1 = Target)
+table_c3 <- summarize_by_target(df_char, target_c3) %>%
+  rename(Other_C3 = Other, Target_C3 = Target)
+
+supp_table7 <- table_c1 %>%
+  full_join(table_c3, by = c("Characteristic", "type"))
+
+char_labels <- c(
+  Engagingness           = "Engagingness",
+  Interactive_Activities = "Interactive Activities",
+  Effortful              = "Effortful",
+  Personalization        = "Personalization",
+  Cognitive_Reframing    = "Cognitive Reframing",
+  Behavioral_Activation  = "Behavioral Activation",
+  Mindfulness            = "Mindfulness",
+  Video_Audio            = "Video/Audio",
+  References_Depression  = "References Depression",
+  Links_to_Resources     = "Links to Resources",
+  Meditation_Practice    = "Meditation Practice",
+  Clinician_Created      = "Clinician Created",
+  Take_Home_Reminder     = "Take-Home Reminder"
+)
+supp_table7 <- supp_table7 %>%
+  mutate(Characteristic = ifelse(Characteristic %in% names(char_labels),
+                                  char_labels[Characteristic],
+                                  Characteristic)) %>%
+  select(-type)
+
+print(supp_table7)
+write.csv(supp_table7,
+          file.path(TABLES_DIR, "supp_table8_ssi_characteristics_by_target.csv"),
+          row.names = FALSE)
+```
+
+# Assignment-strategy comparison
+
+Each strategy is benchmarked against control via a weighted regression of reverse-scored 4-week PHQ-9 on baseline PHQ-9 and a binary treatment indicator. HTE-informed strategies multiply the IPW weight by a design weight that corrects for the number of selected arms per cluster (`12 / k`) and re-calibrates the filtered sample's cluster × treatment proportions to the full completer sample.
+
+```{r strategy-helpers}
+# Step 1: full-sample target proportions
+full_wtd_props <- mydata %>%
+  filter(!is.na(phq9_score_followup)) %>%
+  mutate(int_binary = ifelse(group_numeric_chr == "13", 0, 1)) %>%
+  group_by(cluster_assignment, int_binary) %>%
+  summarise(wsum_full = sum(w_norm), .groups = "drop") %>%
+  mutate(wprop_full = wsum_full / sum(wsum_full))
+
+# Single-strategy fitter that handles arm-count + ratio calibration
+fit_strategy <- function(d, n_arms_lookup) {
+  d <- d %>%
+    filter(!is.na(phq9_score_followup)) %>%
+    mutate(int_opt = ifelse(group_numeric_chr == "13", 0, 1)) %>%
+    mutate(arm_correction = ifelse(int_opt == 1,
+                                   12 / n_arms_lookup[as.character(cluster_assignment)],
+                                   1),
+           w_arm = w_norm * arm_correction)
+
+  filt_props <- d %>%
+    group_by(cluster_assignment, int_opt) %>%
+    summarise(wsum_filt = sum(w_arm), .groups = "drop") %>%
+    mutate(wprop_filt = wsum_filt / sum(wsum_filt)) %>%
+    rename(int_binary = int_opt)
+
+  d <- d %>%
+    left_join(full_wtd_props %>% select(cluster_assignment, int_binary, wprop_full),
+              by = c("cluster_assignment", "int_binary" = "int_binary")) %>%
+    left_join(filt_props %>% select(cluster_assignment, int_binary, wprop_filt),
+              by = c("cluster_assignment", "int_binary" = "int_binary")) %>%
+    mutate(ratio = wprop_full / wprop_filt,
+           w_combined = w_arm * ratio)
+
+  mod <- lm(phq9_score_followup ~ phq9_pre_rev + int_opt,
+            data = d, weights = w_combined)
+  list(d = d, mod = mod,
+       row = tidy(mod) %>% filter(term == "int_opt"))
+}
+```
+
+```{r strategy-fits}
+# Strategy 1: Random — any SSI vs control across the full sample
+mydata_complete <- mydata %>% filter(!is.na(phq9_score_followup))
+lm_s1 <- lm(phq9_score_followup ~ phq9_pre_rev + int_binary,
+            data = mydata_complete, weights = w_norm)
+s1_row <- tidy(lm_s1) %>% filter(term == "int_binary") %>%
+  mutate(strategy = "1_random_assignment")
+
+# Strategy 2: Best aggregate — SSIs 6 & 8 vs control
+d_s2 <- mydata_complete %>%
+  filter(group_numeric_chr %in% c("6", "8", "13")) %>%
+  mutate(int_agg = ifelse(group_numeric_chr == "13", 0, 1))
+lm_s2 <- lm(phq9_score_followup ~ phq9_pre_rev + int_agg,
+            data = d_s2, weights = w_norm)
+s2_row <- tidy(lm_s2) %>% filter(term == "int_agg") %>%
+  mutate(strategy = "2_best_aggregate")
+
+# Strategy 3: HTE-optimal in C1/C3, aggregate (6,8) in C2/C4
+d_s3 <- mydata %>%
+  filter(
+    (cluster_assignment == "1" & group_numeric_chr %in% c("1","5","7","8","9","13")) |
+    (cluster_assignment == "2" & group_numeric_chr %in% c("6","8","13"))             |
+    (cluster_assignment == "3" & group_numeric_chr %in% c("10","12","13"))           |
+    (cluster_assignment == "4" & group_numeric_chr %in% c("6","8","13"))
+  )
+fit_s3 <- fit_strategy(d_s3, c("1" = 5, "2" = 2, "3" = 2, "4" = 2))
+s3_row <- fit_s3$row %>% mutate(strategy = "3_hte_plus_aggregate")
+
+strategy_table <- bind_rows(s1_row, s2_row, s3_row) %>%
+  transmute(strategy,
+            b      = round(estimate,  3),
+            se     = round(std.error, 3),
+            t      = round(statistic, 3),
+            p      = round(p.value,   4))
+
+print(strategy_table)
+```
+
+## Bootstrap pairwise contrasts (5,000 resamples)
+
+```{r bootstrap}
+# Each bootstrap statistic re-fits both strategies on the resampled data
+# and returns the difference in coefficients.
+
+boot_diff_1v2 <- function(data, indices) {
+  d <- data[indices, ]
+  b1 <- coef(lm(phq9_score_followup ~ phq9_pre_rev + int_binary,
+                data = d, weights = w_norm))["int_binary"]
+  d_agg <- d %>% filter(group_numeric_chr %in% c("6","8","13")) %>%
+    mutate(int_agg = ifelse(group_numeric_chr == "13", 0, 1))
+  b2 <- coef(lm(phq9_score_followup ~ phq9_pre_rev + int_agg,
+                data = d_agg, weights = w_norm))["int_agg"]
+  unname(b2 - b1)
+}
+
+boot_strategy_3 <- function(d) {
+  n_arms <- c("1" = 5, "2" = 2, "3" = 2, "4" = 2)
+  d_opt <- d %>%
+    filter(
+      (cluster_assignment == "1" & group_numeric_chr %in% c("1","5","7","8","9","13")) |
+      (cluster_assignment == "2" & group_numeric_chr %in% c("6","8","13"))             |
+      (cluster_assignment == "3" & group_numeric_chr %in% c("10","12","13"))           |
+      (cluster_assignment == "4" & group_numeric_chr %in% c("6","8","13"))
+    ) %>%
+    mutate(int_opt = ifelse(group_numeric_chr == "13", 0, 1),
+           arm_correction = ifelse(int_opt == 1,
+                                   12 / n_arms[as.character(cluster_assignment)],
+                                   1),
+           w_arm = w_norm * arm_correction)
+  filt_props <- d_opt %>%
+    group_by(cluster_assignment, int_opt) %>%
+    summarise(wsum_filt = sum(w_arm), .groups = "drop") %>%
+    mutate(wprop_filt = wsum_filt / sum(wsum_filt)) %>%
+    rename(int_binary = int_opt)
+  d_opt <- d_opt %>%
+    left_join(full_wtd_props %>% select(cluster_assignment, int_binary, wprop_full),
+              by = c("cluster_assignment", "int_binary")) %>%
+    left_join(filt_props %>% select(cluster_assignment, int_binary, wprop_filt),
+              by = c("cluster_assignment", "int_binary")) %>%
+    mutate(ratio = wprop_full / wprop_filt,
+           w_combined = w_arm * ratio)
+  unname(coef(lm(phq9_score_followup ~ phq9_pre_rev + int_opt,
+                 data = d_opt, weights = w_combined))["int_opt"])
+}
+
+boot_diff_1v3 <- function(data, indices) {
+  d <- data[indices, ]
+  b1 <- coef(lm(phq9_score_followup ~ phq9_pre_rev + int_binary,
+                data = d, weights = w_norm))["int_binary"]
+  boot_strategy_3(d) - unname(b1)
+}
+
+boot_diff_2v3 <- function(data, indices) {
+  d <- data[indices, ]
+  d_agg <- d %>% filter(group_numeric_chr %in% c("6","8","13")) %>%
+    mutate(int_agg = ifelse(group_numeric_chr == "13", 0, 1))
+  b2 <- coef(lm(phq9_score_followup ~ phq9_pre_rev + int_agg,
+                data = d_agg, weights = w_norm))["int_agg"]
+  boot_strategy_3(d) - unname(b2)
+}
+
+bootstrap_results <- {
+  set.seed(12345)
+  list(
+    `1v2` = boot(mydata_complete, statistic = boot_diff_1v2, R = 5000),
+    `1v3` = boot(mydata_complete, statistic = boot_diff_1v3, R = 5000),
+    `2v3` = boot(mydata_complete, statistic = boot_diff_2v3, R = 5000)
+  )
+}
+
+summarize_boot <- function(b, label) {
+  ci <- boot.ci(b, type = "perc")
+  z  <- b$t0 / sd(b$t)
+  data.frame(
+    contrast      = label,
+    diff          = round(b$t0,            3),
+    boot_se       = round(sd(b$t),         3),
+    ci_lo         = round(ci$percent[4],   3),
+    ci_hi         = round(ci$percent[5],   3),
+    p_two_sided   = round(2 * pnorm(-abs(z)), 4)
+  )
+}
+
+bootstrap_table <- bind_rows(
+  summarize_boot(bootstrap_results[["1v2"]], "Strategy 2 - Strategy 1"),
+  summarize_boot(bootstrap_results[["1v3"]], "Strategy 3 - Strategy 1"),
+  summarize_boot(bootstrap_results[["2v3"]], "Strategy 3 - Strategy 2")
+)
+print(bootstrap_table)
+```
+
+## Combined Supplementary Table 8 (strategies + bootstrap)
+
+```{r supp-table8}
+strategy_block <- strategy_table %>%
+  transmute(row_type = "strategy_estimate",
+            label    = strategy,
+            estimate = b,
+            se,
+            ci_lo    = NA_real_,
+            ci_hi    = NA_real_,
+            stat     = t,
+            p)
+
+bootstrap_block <- bootstrap_table %>%
+  transmute(row_type = "bootstrap_contrast",
+            label    = contrast,
+            estimate = diff,
+            se       = boot_se,
+            ci_lo,
+            ci_hi,
+            stat     = NA_real_,
+            p        = p_two_sided)
+
+supp_table8 <- bind_rows(strategy_block, bootstrap_block)
+print(supp_table8)
+write.csv(supp_table8,
+          file.path(TABLES_DIR, "supp_table8_strategy_comparison.csv"),
+          row.names = FALSE)
+```
+
+# Demographic Table 1 (descriptive)
+
+Baseline descriptives (N = 7,505), weighted follow-up, and weighted within-arm range.
+
+```{r table1}
+# ---- Derived vars: 4-cat race/ethnicity + 4-cat education + analysis scales ----
+t1 <- mydata %>%
+  mutate(
+    phq9_baseline = phq9_pre_raw,
+    fats_score    = rowSums(across(fats_1_baseline:fats_12_baseline), na.rm = TRUE),
+    agency_score  = agency_q1_baseline + agency_q2_baseline + agency_q3_baseline,
+    bhs4_score    = q1_beck_baseline + q2_beck_baseline +
+                     q3_beck_baseline + q4_beck_baseline,
+    dces_score    = expect_donthelp_r_baseline + expect_wontwork_r_baseline +
+                     expect_positive_baseline,
+    gender_nonbinary_other = as.integer(rowSums(across(c(
+      gender_non_binary_baseline, gender_additional_gender_baseline,
+      gender_agender_baseline, gender_two_spirit_baseline)), na.rm = TRUE) > 0),
+    employment_other = as.integer(rowSums(across(c(
+      employment_business_owner_baseline, employment_retired_baseline,
+      employment_prefer_not_say_baseline)), na.rm = TRUE) > 0),
+
+    # Race is a single-select survey item, so categories are mutually
+    # exclusive and exhaustive.
+    race_asian = as.integer(rowSums(across(c(
+      race_asian_indian_baseline, race_chinese_baseline, race_filipino_baseline,
+      race_vietnamese_baseline, race_korean_baseline, race_japanese_baseline,
+      race_asian_other_baseline)), na.rm = TRUE) > 0),
+    race_napi = as.integer(rowSums(across(c(
+      race_native_american_baseline, race_hawaiian_baseline,
+      race_guamanian_baseline, race_samoan_baseline)), na.rm = TRUE) > 0),
+    # Hispanic or Latino ethnicity (separate survey item from race; yes/no)
+    hispanic = as.integer(rowSums(across(c(
+      ethnicity_mexican_baseline, ethnicity_puerto_rican_baseline,
+      ethnicity_cuban_baseline, ethnicity_other_hispanic_baseline)),
+      na.rm = TRUE) > 0),
+
+    # 4-category education from the 0-8 ordered scale
+    educ_lt_hs   = as.integer(education_ordered_baseline %in% c(0, 1)),
+    educ_hs_ged  = as.integer(education_ordered_baseline == 2),
+    educ_some_ps = as.integer(education_ordered_baseline %in% c(3, 4)),
+    educ_college = as.integer(education_ordered_baseline %in% c(5, 6, 7, 8)),
+
+    # 4-band household income from the 0-16 ordered bracket scale
+    inc_lt40    = as.integer(income_ordered_baseline %in% 0:3),
+    inc_40_80   = as.integer(income_ordered_baseline %in% 4:7),
+    inc_80_100  = as.integer(income_ordered_baseline %in% 8:9),
+    inc_100plus = as.integer(income_ordered_baseline %in% 10:16),
+    inc_prefer  = as.integer(is.na(income_ordered_baseline))
+  )
+
+comp      <- t1 %>% filter(fup_complete == 1)             # weighted FU sample
+arm_order <- c(as.character(1:12), "13")
+arm_names <- c(ssi_labels, "Passive control")
+
+# ---- weighted helpers + one-decimal cell formatters ----
+wmean <- function(x, w) { ok <- !is.na(x) & !is.na(w); sum(x[ok]*w[ok])/sum(w[ok]) }
+wsd   <- function(x, w) { ok <- !is.na(x) & !is.na(w); m <- wmean(x, w)
+                          sqrt(sum(w[ok]*(x[ok]-m)^2)/sum(w[ok])) }
+cell_cont <- function(x, w = NULL) if (is.null(w))
+  sprintf("%.1f (%.1f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE)) else
+  sprintf("%.1f (%.1f)", wmean(x, w), wsd(x, w))
+cell_bin  <- function(x, w = NULL) if (is.null(w))
+  sprintf("%.1f", mean(x == 1, na.rm = TRUE) * 100) else
+  sprintf("%.1f", wmean(as.integer(x == 1), w) * 100)
+est_num   <- function(type, x, w) if (type == "cont") wmean(x, w) else
+  wmean(as.integer(x == 1), w) * 100
+fmt_row   <- function(type, col, d, w) {
+  if (type == "header") return("")
+  if (type == "cont") cell_cont(d[[col]], w) else cell_bin(d[[col]], w)
+}
+
+# ---- row spec: display label, type, source column ----
+ind <- strrep("\u00A0", 4)   # non-breaking spaces so sub-rows indent in docx
+items <- tibble::tribble(
+  ~label,                                            ~type,    ~col,
+  "Age, M (SD)",                                     "cont",   "age_baseline",
+  "Gender, %",                                       "header", NA,
+  paste0(ind, "Woman"),                              "bin",    "gender_woman_baseline",
+  paste0(ind, "Man"),                                "bin",    "gender_man_baseline",
+  paste0(ind, "Non-binary or other gender identity"), "bin",  "gender_nonbinary_other",
+  "Race, %",                                         "header", NA,
+  paste0(ind, "White"),                              "bin",    "race_white_baseline",
+  paste0(ind, "Black or African American"),          "bin",    "race_black_baseline",
+  paste0(ind, "Asian"),                              "bin",    "race_asian",
+  paste0(ind, "American Indian, Alaska Native, or Pacific Islander"), "bin", "race_napi",
+  paste0(ind, "Other"),                              "bin",    "race_other_baseline",
+  paste0(ind, "Prefer not to say"),                  "bin",    "race_prefer_not_say_baseline",
+  "Hispanic or Latino, %",                           "bin",    "hispanic",
+  "Education, %",                                     "header", NA,
+  paste0(ind, "Less than high school"),              "bin",    "educ_lt_hs",
+  paste0(ind, "High school graduate or GED"),        "bin",    "educ_hs_ged",
+  paste0(ind, "Some post-secondary"),                "bin",    "educ_some_ps",
+  paste0(ind, "College graduate"),                   "bin",    "educ_college",
+  "Household income (USD), %",                        "header", NA,
+  paste0(ind, "Less than 40,000"),                   "bin",    "inc_lt40",
+  paste0(ind, "40,000 to 79,999"),                   "bin",    "inc_40_80",
+  paste0(ind, "80,000 to 99,999"),                   "bin",    "inc_80_100",
+  paste0(ind, "100,000 or more"),                    "bin",    "inc_100plus",
+  paste0(ind, "Prefer not to say"),                  "bin",    "inc_prefer",
+  "MacArthur Social Ladder (1-10), M (SD)",          "cont",   "social_ladder_baseline",
+  "Employment status, %",                            "header", NA,
+  paste0(ind, "Full-time employed"),                 "bin",    "employment_full_time_baseline",
+  paste0(ind, "Part-time employed"),                 "bin",    "employment_part_time_baseline",
+  paste0(ind, "Unemployed"),                         "bin",    "employment_unemployed_baseline",
+  paste0(ind, "Not in paid work"),                   "bin",    "employment_not_in_paid_work_baseline",
+  paste0(ind, "Student"),                            "bin",    "employment_student_baseline",
+  paste0(ind, "Other or prefer not to say"),         "bin",    "employment_other",
+  "Disability or chronic condition, %",              "bin",    "disability_yes_baseline",
+  "Prior mental health app use, %",                  "bin",    "help_mental_health_app_baseline",
+  "Prior online mental health resource use, %",      "bin",    "help_online_resource_baseline",
+  "Baseline PHQ-9, M (SD)",                          "cont",   "phq9_baseline",
+  "FATS, M (SD)",                                     "cont",   "fats_score",
+  "Agency (State Hope Scale), M (SD)",               "cont",   "agency_score",
+  "Hopelessness (BHS-4), M (SD)",                    "cont",   "bhs4_score",
+  "Depression change expectancies (DCES), M (SD)",   "cont",   "dces_score"
+)
+
+# ---- compute the three summary columns ----
+build <- items %>%
+  mutate(
+    baseline = vapply(seq_len(n()), function(i)
+      fmt_row(type[i], col[i], t1, NULL), character(1)),
+    weighted_fu = vapply(seq_len(n()), function(i)
+      fmt_row(type[i], col[i], comp, comp$w_norm), character(1)),
+    within_arm = vapply(seq_len(n()), function(i) {
+      if (type[i] == "header") return("")
+      vals <- vapply(arm_order, function(a) {
+        da <- comp[comp$group_numeric == a, ]
+        est_num(type[i], da[[col[i]]], da$w_norm)
+      }, numeric(1))
+      sprintf("%.1f-%.1f", min(vals), max(vals))
+    }, character(1))
+  )
+
+arm_n  <- vapply(arm_order, function(a) sum(comp$group_numeric == a), integer(1))
+table1 <- build %>%
+  transmute(Variable = label,
+            `Baseline (initial randomized sample)` = baseline,
+            `Weighted follow-up`                   = weighted_fu,
+            `Weighted within-arm range`            = within_arm) %>%
+  bind_rows(tibble(
+    Variable = "n",
+    `Baseline (initial randomized sample)` = format(nrow(t1),   big.mark = ","),
+    `Weighted follow-up`                   = format(nrow(comp), big.mark = ","),
+    `Weighted within-arm range`            = sprintf("%d-%d", min(arm_n), max(arm_n))))
+
+print(table1, n = Inf)
+write.csv(table1,
+          file.path(TABLES_DIR, "table1_demographics.csv"),
+          row.names = FALSE, fileEncoding = "UTF-8")
+```
+
+Per-arm weighted follow-up table (one column per arm) for the appendix.
+
+```{r table1-by-arm}
+appendix <- tibble(Variable = items$label)
+for (j in seq_along(arm_order)) {
+  a  <- arm_order[j]
+  da <- comp[comp$group_numeric == a, ]
+  appendix[[arm_names[j]]] <- vapply(seq_len(nrow(items)), function(i) {
+    if (items$type[i] == "header") return("")
+    fmt_row(items$type[i], items$col[i], da, da$w_norm)
+  }, character(1))
+}
+appendix <- bind_rows(appendix, as_tibble_row(
+  c(Variable = "n", setNames(as.character(arm_n), arm_names))))
+
+write.csv(appendix,
+          file.path(TABLES_DIR, "supp_table_demographics_by_arm.csv"),
+          row.names = FALSE, fileEncoding = "UTF-8")
+```
+
+# Differential attrition by cluster
+
+Attrition by LPA cluster (assignments cover all N = 7,505 randomized).
+
+```{r attrition-by-cluster}
+attr_tbl <- mydata %>%
+  mutate(cluster_assignment = factor(cluster_assignment,
+                                     levels = c("1", "2", "3", "4"))) %>%
+  group_by(cluster_assignment) %>%
+  summarise(
+    n_randomized = dplyr::n(),
+    n_completers = sum(fup_complete == 1),
+    n_missing    = sum(fup_complete == 0),
+    pct_missing  = 100 * n_missing / n_randomized,
+    .groups = "drop"
+  )
+print(attr_tbl)
+
+# Overall attrition rate, for context
+overall_pct <- 100 * sum(mydata$fup_complete == 0) / nrow(mydata)
+cat(sprintf("\nOverall attrition: %.2f%% (%d of %d)\n",
+            overall_pct,
+            sum(mydata$fup_complete == 0),
+            nrow(mydata)))
+
+# Chi-square test: cluster x missingness
+chisq_tab <- table(cluster = mydata$cluster_assignment,
+                   missing = 1 - mydata$fup_complete)
+print(chisq_tab)
+chisq_res <- chisq.test(chisq_tab)
+print(chisq_res)
+
+# Logistic regression: P(missing) ~ cluster, Cluster 1 as reference
+mydata$missing_fu <- as.integer(mydata$fup_complete == 0)
+logit_fit <- glm(missing_fu ~ factor(cluster_assignment),
+                 data = mydata, family = binomial())
+logit_summary <- broom::tidy(logit_fit, exponentiate = TRUE,
+                             conf.int = TRUE)
+print(logit_summary)
+
+write.csv(attr_tbl,
+          file.path(TABLES_DIR, "supp_attrition_by_cluster.csv"),
+          row.names = FALSE)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

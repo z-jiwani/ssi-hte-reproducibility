@@ -1,0 +1,7 @@
+"row_type","label","estimate","se","ci_lo","ci_hi","stat","p"
+"strategy_estimate","1_random_assignment",0.328,0.167,NA,NA,1.959,0.0501
+"strategy_estimate","2_best_aggregate",0.668,0.246,NA,NA,2.72,0.0066
+"strategy_estimate","3_hte_plus_aggregate",0.923,0.278,NA,NA,3.321,9e-04
+"bootstrap_contrast","Strategy 2 - Strategy 1",0.34,0.178,-0.007,0.694,NA,0.0559
+"bootstrap_contrast","Strategy 3 - Strategy 1",0.595,0.157,0.278,0.888,NA,2e-04
+"bootstrap_contrast","Strategy 3 - Strategy 2",0.255,0.164,-0.06,0.582,NA,0.1207
